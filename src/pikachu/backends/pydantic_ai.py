@@ -212,14 +212,28 @@ class PydanticAIBackend(BaseBackend):
         # ---- phase 4: finalize (OURS) ---------------------------------------------------
         iterations = sum(1 for m in call.messages if type(m).__name__ == "ModelResponse")
 
+        # Record every tool-call part the model emitted, and whether it actually executed.
+        # A ToolCallPart with a matching ToolReturnPart ran; one the guard removed from the
+        # schema can still be emitted by a primed model and never execute (round-3 finding).
+        # `executed` is what makes tool_calls mean the same thing here as in FakeBackend.
+        returned_ids: set[str] = set()
+        for message in call.messages:
+            for part in getattr(message, "parts", ()):
+                if type(part).__name__ == "ToolReturnPart":
+                    tcid = getattr(part, "tool_call_id", None)
+                    if tcid:
+                        returned_ids.add(str(tcid))
+
         tool_calls: list[dict[str, Any]] = []
         for message in call.messages:
             for part in getattr(message, "parts", ()):
                 if type(part).__name__ == "ToolCallPart":
+                    tcid = getattr(part, "tool_call_id", None)
                     tool_calls.append(
                         {
                             "tool": getattr(part, "tool_name", "?"),
                             "args": str(getattr(part, "args", ""))[:500],
+                            "executed": tcid is not None and str(tcid) in returned_ids,
                         }
                     )
         t_end = time.perf_counter()

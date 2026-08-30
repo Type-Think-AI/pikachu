@@ -601,6 +601,23 @@ class TurnResult(BaseModel):
     text: str
     artifacts: tuple[Artifact, ...] = Field(default_factory=tuple)
     tool_calls: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+    """Tool-call records from the turn. Read the meaning carefully — it differs by backend.
+
+    Round-3 live testing (``docs/test-round-3.md``) found this is NOT the invariant it looks
+    like. Each record carries an ``executed: bool``:
+
+      * ``FakeBackend`` scripts *executed* calls, so every record has ``executed=True`` — in
+        the fake, a record means a tool ran.
+      * ``PydanticAIBackend`` records every ``ToolCallPart`` the model *emits*. The guard
+        removes a denied tool from the schema, but a model primed by a skill body can still
+        emit a call-shaped part for it that never executes — that record has
+        ``executed=False``.
+
+    So the safe invariant is **"``tool_calls`` non-empty ⟹ a tool ran"** ONLY over records
+    where ``executed`` is True. Filter on it; do not treat a non-empty ``tool_calls`` as proof
+    a tool executed. The guard is intact either way — no denied tool ever ran — but a consumer
+    that conflates emitted with executed would draw the wrong conclusion, which passed offline
+    and would have been wrong live."""
 
     input_tokens: Annotated[int, Field(ge=0)] = 0
     output_tokens: Annotated[int, Field(ge=0)] = 0

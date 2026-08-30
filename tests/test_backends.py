@@ -144,7 +144,9 @@ async def test_multi_iteration_turn_folds_into_one_result(agent: AgentSpec, run:
     assert result.text == "thinking\ncalling tool\ndone"
     assert result.iterations == 3
     assert len(result.artifacts) == 1 and result.artifacts[0].id == "art-1"
-    assert result.tool_calls == ({"tool": "read_canvas", "outcome": "success", "args": {}},)
+    assert result.tool_calls == (
+        {"tool": "read_canvas", "outcome": "success", "args": {}, "executed": True},
+    )
     assert result.input_tokens == 100
     assert result.output_tokens == 10
     assert result.cache_read_tokens == 50

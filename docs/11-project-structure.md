@@ -52,17 +52,17 @@ pikachu/
 │   │   ├── events.py               typed event stream (+ ArtifactProduced)
 │   │   └── errors.py               exception taxonomy → billing actions
 │   │
-│   ├── backends/                   C5: one framework, plus a test double
-│   │   ├── base.py                 AgentBackend protocol — THE SEAM
-│   │   ├── pydantic_ai.py
-│   │   └── fake.py
-│   │
-│   ├── guard/                      ★ THE USP — what the standards leave out
+│   ├── backe             ★ THE USP — what the standards leave out
 │   │   ├── allowlist.py            FIXED_ALLOWLIST, ∩ declared (P3)
 │   │   ├── toolsets.py             .filtered() / PrepareTools gate construction
 │   │   ├── scanner.py              injection scan (misses paraphrase — reviewer required)
 │   │   ├── sanitize.py             strip bash/terminal/read_file/browser → removed_tools
-│   │   └── provenance.py           who authored, who produced, what was stripped
+│   │   └── provenannds/                   C5: one framework, plus a test double
+│   │   ├── base.py                 AgentBackend protocol — THE SEAM
+│   │   ├── pydantic_ai.py
+│   │   └── fake.py
+│   │
+│   ├── guard/         ce.py           who authored, who produced, what was stripped
 │   │
 │   ├── skills/                     agentskills.io
 │   │   ├── spec.py                 frontmatter model

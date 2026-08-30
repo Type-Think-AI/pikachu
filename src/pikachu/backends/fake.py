@@ -73,8 +73,19 @@ class ScriptedToolCall:
         object.__setattr__(self, "tool", normalize_tool_name(self.tool))
 
     def as_record(self) -> dict[str, Any]:
-        """The dict shape recorded in ``TurnResult.tool_calls``."""
-        return {"tool": self.tool, "outcome": self.outcome.value, "args": self.args}
+        """The dict shape recorded in ``TurnResult.tool_calls``.
+
+        ``executed`` is True unless the scripted outcome says the call never ran
+        (``DENIED``). This keeps the field meaning the same as the live backend, where a
+        denied/emitted-but-unexecuted call is ``executed=False`` — see the note on
+        ``TurnResult.tool_calls``.
+        """
+        return {
+            "tool": self.tool,
+            "outcome": self.outcome.value,
+            "args": self.args,
+            "executed": self.outcome is not ToolOutcome.DENIED,
+        }
 
 
 @dataclass(frozen=True)
