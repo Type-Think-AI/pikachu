@@ -34,7 +34,7 @@ pytestmark = [
 
 
 def _record(result: object, record: TaskRecord) -> None:
-    """Copy metrics off a TurnResult onto the report record."""
+    """Copy metrics off a TurnResult onto the report record, including timing phases."""
     for attr in (
         "input_tokens",
         "output_tokens",
@@ -45,6 +45,13 @@ def _record(result: object, record: TaskRecord) -> None:
         setattr(record, attr, getattr(result, attr, 0))
     record.duration_ms = getattr(result, "latency_ms", 0)
     record.response = getattr(result, "text", "")
+    timing = getattr(result, "timing", None)
+    if timing is not None:
+        record.setup_ms = timing.setup_ms
+        record.wait_ms = timing.wait_ms
+        record.stream_ms = timing.stream_ms
+        record.finalize_ms = timing.finalize_ms
+        record.streaming_measured = timing.streaming_measured
 
 
 async def test_01_agent_answers_at_all(live_backend, collector: Collector) -> None:

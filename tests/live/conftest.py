@@ -39,6 +39,13 @@ class TaskRecord:
     description: str
     status: str = "not run"
     duration_ms: int = 0
+    # Phase-resolved timing. A single blended latency cannot tell you whether the framework or
+    # the model got slower, which is the only question worth asking of a latency number.
+    setup_ms: int = 0
+    wait_ms: int = 0
+    stream_ms: int = 0
+    finalize_ms: int = 0
+    streaming_measured: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
@@ -48,6 +55,25 @@ class TaskRecord:
     response: str = ""
     detail: str = ""
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def framework_ms(self) -> int:
+        """Time Pikachu is responsible for — the only part we can optimise."""
+        return self.setup_ms + self.finalize_ms
+
+    @property
+    def model_ms(self) -> int:
+        """Time the provider and model are responsible for."""
+        return self.wait_ms + self.stream_ms
+
+    @property
+    def framework_share(self) -> float:
+        return self.framework_ms / self.duration_ms if self.duration_ms else 0.0
+
+    @property
+    def tokens_per_second(self) -> float:
+        """Decode throughput, using stream time only so queue time does not dilute it."""
+        return self.output_tokens / (self.stream_ms / 1000) if self.stream_ms else 0.0
 
     @property
     def total_tokens(self) -> int:
@@ -115,15 +141,87 @@ class Collector:
             "",
             "## Summary",
             "",
-            "| Task | Status | Time | In | Out | Cache read | Iters |",
-            "|---|---|---:|---:|---:|---:|---:|",
+            "| Task | Status | Total | Framework | Model | In | Out | Cache | Iters |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for r in self.records:
             mark = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}.get(r.status, "·")
             lines.append(
-                f"| {r.name} | {mark} {r.status} | {r.duration_ms} ms | {r.input_tokens} | "
+                f"| {r.name} | {mark} {r.status} | {r.duration_ms} ms | "
+                f"{r.framework_ms} ms | {r.model_ms} ms | {r.input_tokens} | "
                 f"{r.output_tokens} | {r.cache_read_tokens} | {r.iterations} |"
             )
+
+        # ---- the attribution section: whose time was it? --------------------------------
+        fw = sum(r.framework_ms for r in self.records)
+        md = sum(r.model_ms for r in self.records)
+        wait = sum(r.wait_ms for r in self.records)
+        stream = sum(r.stream_ms for r in self.records)
+        setup = sum(r.setup_ms for r in self.records)
+        finalize = sum(r.finalize_ms for r in self.records)
+        out_tokens = sum(r.output_tokens for r in self.records)
+        share = fw / total_ms if total_ms else 0.0
+
+        lines += [
+            "",
+            "## Where the time went",
+            "",
+            "A single blended latency number cannot tell you whether **our framework** or "
+            "**the model** got slower — swap provider and it moves for reasons that have "
+            "nothing to do with our code. So each phase is attributed to whoever spent it.",
+            "",
+            "| Phase | Owner | Total | Share | What it is |",
+            "|---|---|---:|---:|---|",
+            f"| setup | **ours** | {setup} ms | {setup / total_ms * 100 if total_ms else 0:.2f}% | "
+            "build model object, compose instructions, resolve tools, construct agent |",
+            f"| wait | provider | {wait} ms | {wait / total_ms * 100 if total_ms else 0:.2f}% | "
+            "request sent → first token: network round trip, provider queue, input prefill |",
+            f"| stream | provider | {stream} ms | {stream / total_ms * 100 if total_ms else 0:.2f}% | "
+            "first token → last token: decode, scales with output tokens |",
+            f"| finalize | **ours** | {finalize} ms | "
+            f"{finalize / total_ms * 100 if total_ms else 0:.2f}% | "
+            "read usage, walk messages, build result |",
+            "",
+            f"**Framework total: {fw} ms ({share * 100:.2f}%). Model total: {md} ms "
+            f"({(1 - share) * 100:.2f}%).**",
+            "",
+        ]
+        if out_tokens and stream:
+            lines += [
+                f"Decode throughput: **{out_tokens / (stream / 1000):.0f} tokens/sec** "
+                f"({out_tokens} output tokens in {stream} ms of decode). Measured on stream "
+                "time only, so provider queueing does not dilute it.",
+                "",
+            ]
+        if share < 0.05:
+            lines += [
+                f"**Read this as: the framework is not the bottleneck.** At {share * 100:.2f}% "
+                "of wall clock, optimising Pikachu's own code cannot meaningfully change turn "
+                "latency. The levers that matter are the model, the provider/region, and the "
+                "size of the prompt and requested output.",
+                "",
+            ]
+        else:
+            lines += [
+                f"**Framework share is {share * 100:.2f}%, which is high enough to investigate.** "
+                "Check whether `setup` is being paid per turn rather than once — agent "
+                "construction should be near-free after the first call.",
+                "",
+            ]
+        if wait > stream * 3 and stream:
+            lines += [
+                f"`wait` is {wait / stream:.1f}× `stream`, so this turn spent far longer "
+                "**waiting** for the provider than **receiving** from it. Waiting is provider "
+                "queue and network, not model speed — a faster model would not help; a less "
+                "contended provider or region would.",
+                "",
+            ]
+        if not any(r.streaming_measured for r in self.records):
+            lines += [
+                "> Note: no task measured the wait/stream split, so all model time is reported "
+                "as `wait`. The split needs streaming to be available.",
+                "",
+            ]
 
         # The headline finding: did prompt caching actually engage?
         lines += [
@@ -168,7 +266,11 @@ class Collector:
                 "",
                 f"{r.description}",
                 "",
-                f"- **Duration:** {r.duration_ms} ms",
+                f"- **Duration:** {r.duration_ms} ms "
+                f"(framework {r.framework_ms} ms · model {r.model_ms} ms)",
+                f"- **Phases:** setup {r.setup_ms} ms · wait {r.wait_ms} ms · "
+                f"stream {r.stream_ms} ms · finalize {r.finalize_ms} ms"
+                + ("" if r.streaming_measured else "  _(wait/stream split unavailable)_"),
                 f"- **Model:** `{r.model or DEFAULT_MODEL}`",
                 f"- **Tokens:** {r.input_tokens} in / {r.output_tokens} out / "
                 f"{r.cache_read_tokens} cache-read / {r.cache_write_tokens} cache-write",

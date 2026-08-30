@@ -40,6 +40,7 @@ __all__ = [
     "TrustTier",
     "TurnRequest",
     "TurnResult",
+    "TurnTiming",
     "normalize_tool_name",
     "utcnow",
 ]
@@ -524,6 +525,74 @@ class TurnRequest(BaseModel):
     run_id: str | None = None
 
 
+class TurnTiming(BaseModel):
+    """Where a turn's wall-clock time actually went.
+
+    A single blended latency number is close to useless for tuning, because it moves when the
+    *model* changes and when *our code* changes, and you cannot tell which happened. Swap
+    provider and the number jumps — that tells you nothing about whether the framework
+    regressed.
+
+    So time is attributed to whoever spent it:
+
+    ==================  ====================================================================
+    ``setup_ms``        **Ours.** Building the model object, composing instructions, resolving
+                        the toolset, constructing the agent. Pure framework overhead.
+    ``wait_ms``         **Not ours.** Request sent -> first token back: network round trip,
+                        provider queueing, and prefill of the input. Dominated by distance to
+                        the provider and by how busy it is.
+    ``stream_ms``       **Not ours.** First token -> last token: decode. Scales with OUTPUT
+                        tokens, so it is the part that grows when the model is verbose.
+    ``finalize_ms``     **Ours.** Reading usage, walking messages, building the result.
+    ==================  ====================================================================
+
+    The two properties that matter for decisions are ``framework_ms`` (what we can optimise)
+    and ``model_ms`` (what we can only choose differently). If ``framework_share`` is a few
+    percent, optimising our code is pointless and the lever is the model or the prompt. If it
+    climbs, we regressed and the number says so regardless of which model was in use.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    setup_ms: Annotated[int, Field(ge=0)] = 0
+    wait_ms: Annotated[int, Field(ge=0)] = 0
+    stream_ms: Annotated[int, Field(ge=0)] = 0
+    finalize_ms: Annotated[int, Field(ge=0)] = 0
+    total_ms: Annotated[int, Field(ge=0)] = 0
+
+    streaming_measured: bool = False
+    """Whether wait/stream were measured separately. When False the whole model call is
+    reported in ``wait_ms`` and the split is unavailable — do not present it as if it were."""
+
+    @property
+    def framework_ms(self) -> int:
+        """Time Pikachu itself is responsible for. The only part we can optimise."""
+        return self.setup_ms + self.finalize_ms
+
+    @property
+    def model_ms(self) -> int:
+        """Time the provider and model are responsible for."""
+        return self.wait_ms + self.stream_ms
+
+    @property
+    def unattributed_ms(self) -> int:
+        """Whatever the phases did not account for.
+
+        Should be near zero. A large value means the instrumentation missed a phase, which is
+        worth knowing rather than silently folding into one of the others.
+        """
+        return max(0, self.total_ms - self.framework_ms - self.model_ms)
+
+    @property
+    def framework_share(self) -> float:
+        """Fraction of the turn spent in our code, 0.0-1.0."""
+        return self.framework_ms / self.total_ms if self.total_ms else 0.0
+
+    def tokens_per_second(self, output_tokens: int) -> float:
+        """Decode throughput. Uses ``stream_ms`` only, so it is not diluted by queue time."""
+        return output_tokens / (self.stream_ms / 1000) if self.stream_ms else 0.0
+
+
 class TurnResult(BaseModel):
     """Outcome of one turn."""
 
@@ -540,9 +609,13 @@ class TurnResult(BaseModel):
     cost_credits: Annotated[int, Field(ge=0)] = 0
     iterations: Annotated[int, Field(ge=0)] = 0
     latency_ms: Annotated[int, Field(ge=0)] = 0
-    """Wall-clock duration of the turn. 0 means not measured (e.g. a fake backend that did
-    not bother). Reported in the live-test markdown report, and the number to watch when
-    judging whether prompt caching is actually helping."""
+    """Total wall clock for the turn. Kept as a single headline number, but prefer ``timing``
+    for any decision: this one moves when either the model OR our code changes, so on its own
+    it cannot tell you which."""
+
+    timing: TurnTiming = Field(default_factory=TurnTiming)
+    """Phase-resolved breakdown. See ``TurnTiming`` — ``framework_ms`` is ours to optimise,
+    ``model_ms`` is not."""
 
     @property
     def cache_hit_ratio(self) -> float:
