@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+*.egg-info/
+
+# Secrets. .env.example is committed; .env never is.
+.env
+.env.local

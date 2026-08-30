@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.28.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pikachu"
+version = "0.0.1"
+description = "An agent runtime that implements the open agent standards and supplies the permission, confinement and provenance layer they leave to the runtime."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+
+# Pinned exactly, not ranged. A dependency changing its distribution model with no
+# warning is what motivated this project; ranges are how that arrives silently.
+#
+# NOTE: pydantic-ai is on V2 (2.36.0). The design docs cite "V1 since Sept 2025, no
+# breaking changes until V2" as the stability argument and record an API surface verified
+# against V1 docs. V2 has now shipped, so every recorded symbol is UNVERIFIED against the
+# installed version until Lane E confirms it.
+dependencies = [
+    "pydantic==2.13.5",
+    "pydantic-ai-slim[openai]==2.36.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "hypothesis==6.167.0",
+    "mypy==2.3.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pikachu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Gym badges. Each marker is a tier-1 invariant suite that gates shipping.
+# Tier-2 trend stats are NOT markers here - see scripts/report.py.
+markers = [
+    "boulder: types are solid - models validate, mypy strict",
+    "cascade: contracts flow - protocols round-trip through their fakes",
+    "thunder: the guard holds - P3 effective subset of allowlist intersect declared",
+    "rainbow: skills load safely - SKILL.md parses, scanner rejects injection",
+    "soul: taint propagates - lineage tracking, tainted never promotes",
+    "marsh: memory cannot lie - memory never widens authority",
+    "volcano: it actually runs - full turn end-to-end on FakeBackend",
+    "earth: grounded in measurement - cache, token and latency budgets",
+]
+filterwarnings = ["error"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+disallow_any_explicit = false
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
