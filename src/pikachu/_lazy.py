@@ -87,6 +87,7 @@ LAZY_SUBMODULES: tuple[str, ...] = (
     "skills",
     "storage",
     "telemetry",
+    "tools",
     "webmcp",
 )
 """Deferred submodule/attribute names for the top-level ``pikachu`` package.

@@ -32,6 +32,7 @@ if TYPE_CHECKING:  # type-checker / IDE only — dead at runtime, imports nothin
         skills as skills,
         storage as storage,
         telemetry as telemetry,
+        tools as tools,
     )
 
 from pikachu.core.errors import (
