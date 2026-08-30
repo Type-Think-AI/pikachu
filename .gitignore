@@ -9,3 +9,7 @@ __pycache__/
 # Secrets. .env.example is committed; .env never is.
 .env
 .env.local
+
+# Generated run artifacts from scripts/ (demo_run.py, conversation_md.py).
+# The scripts are source and are committed; their output is reproducible and is not.
+scripts/logs/

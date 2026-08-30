@@ -16,7 +16,7 @@ symbol used here disappears.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -28,6 +28,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from pikachu.backends.base import BaseBackend
 from pikachu.config import DEFAULT_MODEL
 from pikachu.core.errors import PikachuError
+from pikachu.core.events import TextDelta, TurnEvent, TurnFinished, TurnStarted
 from pikachu.core.types import TurnRequest, TurnResult, TurnTiming
 
 __all__ = ["PydanticAIBackend"]
@@ -182,28 +183,7 @@ class PydanticAIBackend(BaseBackend):
         t_start = time.perf_counter()
 
         # ---- phase 1: setup (OURS) -----------------------------------------------------
-        model_name = request.agent.model or self._model_name
-        settings: OpenAIChatModelSettings | None = None
-        if self._routing is not None:
-            settings = OpenAIChatModelSettings(extra_body={"provider": dict(self._routing)})
-        model = OpenAIChatModel(model_name, provider=self._provider, settings=settings)
-
-        # Static instructions first so the cacheable prefix stays byte-identical across the
-        # iterations of one turn (invariant P10). A skill body is appended after the agent's
-        # own instructions and before any dynamic content for the same reason.
-        instructions = request.agent.instructions or ""
-        if request.skill is not None and request.skill.body:
-            instructions = f"{instructions}\n\n{request.skill.body}".strip()
-
-        agent: Agent[None, str] = Agent(
-            model,
-            instructions=instructions or None,
-            # toolsets= rather than tools= on purpose: raw callables make Pydantic AI
-            # regenerate every tool's JSON schema and re-parse its docstring on each
-            # construction, which profiling showed to be 94% of Agent() cost.
-            toolsets=[ts] if (ts := self._toolset_for(request)) is not None else [],
-            retries=2,
-        )
+        agent = self._build_agent(request)
         t_setup_done = time.perf_counter()
 
         # ---- phase 2+3: the model call (NOT OURS) ---------------------------------------
@@ -280,6 +260,92 @@ class PydanticAIBackend(BaseBackend):
             timing=timing,
             served_by=served_by,
         )
+
+    def _build_agent(self, request: TurnRequest) -> Agent[None, str]:
+        """Construct the per-turn agent. Shared by run_turn and stream_turn so the two can
+        never diverge on model, instructions, toolset or routing.
+
+        Instructions are static-first so the cacheable prefix stays byte-identical across the
+        iterations of one turn (invariant P10). Tools go in via a cached toolset, not raw
+        callables, because raw callables make Pydantic AI regenerate every tool's JSON schema
+        and re-parse its docstring on each construction — 94% of Agent() cost.
+        """
+        model_name = request.agent.model or self._model_name
+        settings: OpenAIChatModelSettings | None = None
+        if self._routing is not None:
+            settings = OpenAIChatModelSettings(extra_body={"provider": dict(self._routing)})
+        model = OpenAIChatModel(model_name, provider=self._provider, settings=settings)
+
+        instructions = request.agent.instructions or ""
+        if request.skill is not None and request.skill.body:
+            instructions = f"{instructions}\n\n{request.skill.body}".strip()
+
+        return Agent(
+            model,
+            instructions=instructions or None,
+            toolsets=[ts] if (ts := self._toolset_for(request)) is not None else [],
+            retries=2,
+        )
+
+    async def stream_turn(self, request: TurnRequest) -> AsyncIterator[TurnEvent]:
+        """Native live event stream — the path ``backends/streaming.py`` delegates to.
+
+        The deltas are the SAME ones ``_call`` iterates to measure time-to-first-token; here
+        they are emitted instead of discarded. Each provider SSE chunk becomes one
+        :class:`TextDelta`, so a chat UI renders the answer as it arrives rather than in one
+        blob. The terminal :class:`TurnFinished` carries a full :class:`TurnResult` equal in
+        shape to what ``run_turn`` returns. A live-stream failure falls back to ``run_turn``.
+        """
+        yield TurnStarted(agent_name=request.agent.name, streaming=True)
+
+        t_start = time.perf_counter()
+        agent = self._build_agent(request)
+        t_setup = time.perf_counter()
+
+        try:
+            first: float | None = None
+            pieces: list[str] = []
+            async with agent.run_stream(request.message) as stream:
+                async for chunk in stream.stream_text(delta=True):
+                    if first is None:
+                        first = time.perf_counter()
+                    if chunk:
+                        pieces.append(chunk)
+                        yield TextDelta(text=chunk)
+                output = str(await stream.get_output())
+                usage = _maybe_call(getattr(stream, "usage", None))
+                messages = list(stream.all_messages())
+            done = time.perf_counter()
+        except Exception:  # noqa: BLE001 - a live-stream failure must not kill the turn
+            result = await self.run_turn(request)
+            if result.text:
+                yield TextDelta(text=result.text)
+            yield TurnFinished(result=result)
+            return
+
+        def ms(a: float, b: float) -> int:
+            return max(0, int((b - a) * 1000))
+
+        timing = TurnTiming(
+            setup_ms=ms(t_start, t_setup),
+            wait_ms=ms(t_setup, first) if first else ms(t_setup, done),
+            stream_ms=ms(first, done) if first else 0,
+            finalize_ms=0,
+            total_ms=ms(t_start, done),
+            streaming_measured=first is not None,
+        )
+        iterations = sum(1 for m in messages if type(m).__name__ == "ModelResponse")
+        result = TurnResult(
+            text=output or "".join(pieces),
+            input_tokens=_int_of(usage, "input_tokens"),
+            output_tokens=_int_of(usage, "output_tokens"),
+            cache_read_tokens=_int_of(usage, "cache_read_tokens"),
+            cache_write_tokens=_int_of(usage, "cache_write_tokens"),
+            iterations=max(iterations, 1),
+            latency_ms=timing.total_ms,
+            timing=timing,
+        )
+        yield TurnFinished(result=result)
 
     async def _call(self, agent: Agent[None, str], message: str) -> _CallOutcome:
         """Execute the run, capturing the first-token moment when possible.
