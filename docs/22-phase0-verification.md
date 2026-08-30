@@ -47,6 +47,25 @@ the SDK.
    speaking an older revision is not.
 3. Do not build a shim. There is nothing to shim — the protocol layer is the SDK's job.
 
+### ✅ RESOLVED 2026-08-30 — and requirement 2 turns out to be essential
+
+`mcp 2.1.1` was installed into the framework-comparison venv (as a transitive dependency of
+`openai-agents`) and inspected directly:
+
+```
+mcp.types.LATEST_PROTOCOL_VERSION:     2026-07-28
+mcp.types.DEFAULT_NEGOTIATED_VERSION:  2025-03-26
+```
+
+So **2026-07-28 is supported** — `mcp/` is not blocked, and the verdict above holds.
+
+The second line is the important one and it was not anticipated: the **default negotiated revision
+is `2025-03-26`**, three revisions behind. A client that does not explicitly ask for `2026-07-28`
+silently negotiates the old revision and loses statelessness, required `server/discover`, and
+`resultType`. The failure mode is a **silent downgrade, not an error**, which is exactly the kind of
+thing a conformance test exists to catch. Requirement 2 above is therefore mandatory rather than
+good practice.
+
 ---
 
 ## Q2 — Agent Plugins 1.0.0 schema, field by field
