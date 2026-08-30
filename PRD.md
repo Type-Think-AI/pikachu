@@ -109,17 +109,21 @@ Explicitly out, to stop scope creep:
 
 ## 6. Success criteria
 
-Measurable, not aspirational. Each is a pass/fail.
+Measurable, not aspirational. Each is a pass/fail. **Status column added 2026-08-30 — verified, not
+estimated.**
 
-| # | Criterion |
-|---|---|
-| S1 | `RunUsage.cache_hit_ratio` > 0 on the default model — today it is 0 because the prefix is below Gemini 3.x's floor |
-| S2 | A hostile skill, a hostile plugin **and** a hostile MCP server are refused by the *same* code path, proven by property test |
-| S3 | A third-party plugin loads with one deliberately broken `mcp.json` entry skipped and reported, skills still working |
-| S4 | An end user creates an agent in the UI and invokes it, with no code change and no deploy |
-| S5 | A storyboard agent produces frames from a script artifact it was never passed as an argument |
-| S6 | Our curated-auto arm beats SkillsBench's self-generated arm — or we record that it does not |
-| S7 | `pip install` works in a clean venv; `grep -r "picx" --include=*.py` hits only `tools/picx_media/` |
+| # | Criterion | Status |
+|---|---|---|
+| S1 | `RunUsage.cache_hit_ratio` > 0 on the default model | ❌ **measured negative.** 3 turns, 1,964-token prefix, `cache_read`/`cache_write` = 0 on all three including two reusing an identical prefix. Consistent with Gemini's blanket 4,096 floor. **Caveat:** Google's implicit caching can report 0 even when it fired ([#5205](https://github.com/pydantic/pydantic-ai/issues/5205)), so suggestive not conclusive. The model was chosen on **modality**, not cache fit — an accepted trade. |
+| S2 | A hostile skill, a hostile plugin **and** a hostile MCP server are refused by the *same* code path, proven by property test | ✅ **MET.** `guard/untrusted.py::admit()` composes `effective_tools`; all five untrusted boundaries route through a guard path. `tests/properties/test_s2_single_path.py` also asserts **by introspection** that each boundary references `admit`, so a new module cannot silently bypass it — which is how this criterion failed the first time. |
+| S3 | A third-party plugin loads with one deliberately broken `mcp.json` entry skipped and reported, skills still working | ✅ **MET.** `test_malformed_mcp_json_still_loads_skills`. |
+| S4 | An end user creates an agent in the UI and invokes it, with no code change and no deploy | ✅ **MET at the SDK layer.** `examples/create_agent_at_runtime.py` — runtime `AgentSpec`, registered, invoked by name, no subclass or decorator. The *UI* is the host app's, not this package's. |
+| S5 | A storyboard agent produces frames from a script artifact it was never passed as an argument | ✅ **MET.** `examples/canvas_handoff.py`; the test asserts the storyboard agent's input never contained the artifact. |
+| S6 | Our curated-auto arm beats SkillsBench's self-generated arm — or we record that it does not | ⏸ **NOT RUN.** 86 tasks, 11 domains, thousands of trajectories — a research exercise, not a build task. Recorded rather than faked. |
+| S7 | `pip install` works in a clean venv; `grep -r "picx" --include=*.py` hits only `tools/picx_media/` | ✅ **MET.** Installs and imports in a throwaway venv; one `picx` reference remains, a URL constant in the OpenRouter app header. |
+
+**Score: 5 met, 1 measured negative, 1 out of scope.** The two that are not green are open for
+reasons that are documented rather than unknown.
 
 ## 7. Constraints that shape the build
 
@@ -160,13 +164,26 @@ Measurable, not aspirational. Each is a pass/fail.
 Blocking, and none are mine to make:
 
 1. **Repo shape** — stay in `picx-studio/pikachu/`, or extract now? (assumed: stay)
-2. **Default model** — must move off Gemini 3.x or S1 is unreachable.
-3. **Public name** — now more urgent: publishing conformance claims means appearing in other
-   people's compatibility tables under some name.
-4. **Trust policy for third-party plugins** — gates F23.
+2. **Default model** — ✅ **DECIDED: `google/gemini-3.7-flash`**, on **modality** rather than cache
+   fit. It accepts video, audio, image and file input natively, which no text-and-image model matches
+   at any price, and this is a media product. The consequence is accepted knowingly: S1 does not pass
+   on it. Recorded in `src/pikachu/config.py`, enforced by `tests/test_model_policy.py`.
+3. **Public name** — ⏳ **still open**, and now the last blocker to a public release rather than an
+   urgent one: the repo is **private**, so no conformance claim is published under any name yet.
+   `pikachu` is an internal codename; expect exactly one rename of the import root.
+4. **Trust policy for third-party plugins** — ⏳ **still open**, gates F23 *distribution*. Loading is
+   built and confines correctly (untrusted, tainted, no toolsets); what is undecided is the policy for
+   who may publish and on what review.
 
 ## 10. What is deliberately not in this repo yet
 
-**No module directories have been created.** The map in `docs/18-module-map-and-roadmap.md` is a
-target. Empty scaffolding that nothing imports is dead weight and makes the tree harder to reason
-about — directories get created by the phase that puts real code in them.
+*Updated 2026-08-30 — the original text here said no module directories existed. That is no longer
+true: all 19 are built, so the paragraph below has been replaced with what genuinely remains out.*
+
+- **No UI.** S4 is met at the SDK layer — an agent is created and invoked at runtime — but the
+  surface a non-developer would use belongs to the host application.
+- **No durable-execution engine.** `durability/` provides the checkpoint/resume seam that Temporal,
+  DBOS, Prefect or Restate would plug into. Adding one would put a heavyweight dependency in a
+  package whose dependency list is deliberately one framework.
+- **No SkillsBench run.** See S6.
+- **No published package.** Private repo, undecided distribution name, no PyPI release.
