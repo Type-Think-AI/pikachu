@@ -118,6 +118,24 @@ def _tool_args_of(record: object) -> str:
     return ""
 
 
+def _tool_call_id_of(record: object, index: int) -> str:
+    """Best-effort stable id for a reconstructed tool call.
+
+    A backend's ``tool_calls`` record MAY carry an id (``tool_call_id`` or ``id``); when it
+    does we reuse it so the reconstructed started/finished pair correlates on the same id the
+    live path would have used. When it does not, we synthesise a deterministic per-turn id
+    from the call's position — enough for a consumer to pair the start with the finish within
+    this one reconstructed stream, and stable across identical reruns (the whole degraded path
+    is deterministic). It is not, and does not claim to be, a provider id.
+    """
+    if isinstance(record, dict):
+        for key in ("tool_call_id", "id"):
+            raw = record.get(key)
+            if isinstance(raw, str) and raw:
+                return raw
+    return f"reconstructed-{index}"
+
+
 async def _reconstruct(request: TurnRequest, result: TurnResult) -> AsyncIterator[TurnEvent]:
     """Rebuild a coherent event sequence from a completed, authoritative result.
 
@@ -125,13 +143,18 @@ async def _reconstruct(request: TurnRequest, result: TurnResult) -> AsyncIterato
     in real time. It reproduces the *structure* of the turn faithfully — the tool calls in
     the order the backend recorded them, each artifact it produced, and the full text —
     then closes with the real result. It never invents ordering the result does not encode.
+
+    Each reconstructed call carries a ``call_id`` (from the record when present, else a
+    deterministic positional id) so a consumer correlates the started/finished pair even
+    here, where there was no live provider id to carry.
     """
     yield TurnStarted(agent_name=request.agent.name, streaming=False)
 
-    for record in result.tool_calls:
+    for index, record in enumerate(result.tool_calls):
         name = _tool_name_of(record)
-        yield ToolCallStarted(tool=name, args=_tool_args_of(record))
-        yield ToolCallFinished(tool=name, outcome=_outcome_of(record))
+        call_id = _tool_call_id_of(record, index)
+        yield ToolCallStarted(call_id=call_id, tool=name, args=_tool_args_of(record))
+        yield ToolCallFinished(call_id=call_id, tool=name, outcome=_outcome_of(record))
 
     for artifact in result.artifacts:
         yield ArtifactProduced(artifact=artifact)

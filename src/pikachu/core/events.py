@@ -16,9 +16,13 @@ Ordering guarantee, asserted by the streaming tests:
 
 * :class:`TurnStarted` is always first.
 * :class:`TurnFinished` is always last, and appears exactly once.
-* A tool call is always a :class:`ToolCallStarted` followed by its
-  :class:`ToolCallFinished`, in that order, carrying the tool's
-  :class:`~pikachu.core.types.ToolOutcome`.
+* A tool call is always a :class:`ToolCallStarted` followed by zero or more
+  :class:`ToolCallProgress` events and then its :class:`ToolCallFinished`, in that order,
+  the finished event carrying the tool's :class:`~pikachu.core.types.ToolOutcome`. All three
+  share a stable ``call_id`` so a consumer correlates start, progress and finish into one
+  rendered tool card. A tool that crashes still emits its :class:`ToolCallFinished` (with
+  ``outcome == ToolOutcome.FAILED``), so a failure never strands the stream before
+  :class:`TurnFinished`.
 
 Consistent with the rest of ``core/``: frozen Pydantic models, dependency-light, no
 knowledge of Pydantic AI, HTTP, or a backend implementation.
@@ -36,6 +40,7 @@ __all__ = [
     "ArtifactProduced",
     "TextDelta",
     "ToolCallFinished",
+    "ToolCallProgress",
     "ToolCallStarted",
     "TurnEvent",
     "TurnFinished",
@@ -77,23 +82,80 @@ class TextDelta(BaseModel):
 
 
 class ToolCallStarted(BaseModel):
-    """A tool call has begun. Always paired with a later :class:`ToolCallFinished`."""
+    """A tool call has begun. Always paired with a later :class:`ToolCallFinished`.
+
+    ``call_id`` is a STABLE per-call correlation id: it is emitted here and repeated on every
+    :class:`ToolCallProgress` for this call and on its terminating :class:`ToolCallFinished`,
+    so a consumer ties the three together and renders one tool card that transitions from a
+    "generating" skeleton to the finished asset. This is the Pikachu analogue of the
+    ``tool_call_id`` PicX's Hermes handler emits on its ``tool_started`` payload
+    (``api/app/groot/agent_tools.py::_emit``) — the property that lets a minutes-long media
+    generation not look frozen.
+
+    It defaults to ``""`` because the degraded/reconstructed streaming path
+    (:func:`pikachu.backends.streaming.stream_turn` when a backend does not stream natively)
+    has no provider-issued id to carry: the turn already completed, so there is nothing live
+    to correlate. On the native path (``PydanticAIBackend.stream_turn``) it carries the
+    provider's own ``tool_call_id``, which is the same id the matching result part carries.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["tool_call_started"] = "tool_call_started"
     tool: str
+    call_id: str = ""
+    """Stable per-call id shared with this call's progress and finished events. Empty on the
+    reconstructed path (no live id to correlate); the provider's ``tool_call_id`` on the
+    native path."""
     args: str = ""
     """A rendered, size-bounded view of the arguments — a string, not the live object, so an
     event is cheap to log and carries no reference a consumer could mutate."""
 
 
+class ToolCallProgress(BaseModel):
+    """Progress within a tool call that is still running.
+
+    A video generation takes minutes; ``started`` then a long silence then ``finished`` is
+    indistinguishable from a hung turn. This event fills that gap — emitted zero or more times
+    between a call's :class:`ToolCallStarted` and its :class:`ToolCallFinished`, carrying the
+    **same** :attr:`call_id` so a consumer updates the one skeleton it already rendered rather
+    than drawing a new card.
+
+    It is advisory: a consumer that ignores it loses nothing but the live progress text. It is
+    never load-bearing for correctness — ordering and the final outcome live on the
+    started/finished pair — so a backend that cannot report progress simply emits none, and
+    the lifecycle is still complete.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["tool_call_progress"] = "tool_call_progress"
+    tool: str
+    call_id: str = ""
+    """The id of the in-flight call this progress belongs to. Same value as the call's
+    :class:`ToolCallStarted`."""
+    message: str = ""
+    """Human-readable progress note, e.g. ``"queued"`` / ``"rendering 50%"``. Size-bounded and
+    display-only; never parsed for control flow."""
+    percent: float | None = None
+    """Optional 0.0–1.0 completion fraction when the backend can estimate one; ``None`` when it
+    cannot. A consumer must tolerate ``None`` rather than assume a number is always present."""
+
+
 class ToolCallFinished(BaseModel):
-    """A tool call has completed, carrying its outcome.
+    """A tool call has completed, carrying its outcome and correlation id.
 
     The :class:`~pikachu.core.types.ToolOutcome` is load-bearing: ``INTERRUPTED`` is not
     ``FAILED``, and a consumer showing progress must be able to tell a denied call from a
-    failed one from a paid one that may have fired.
+    failed one from a paid one that may have fired. ``outcome == ToolOutcome.FAILED`` is the
+    **failure signal** for a crashed tool: a tool that raised still emits this event (so the
+    skeleton resolves to an error state) and the stream still terminates with
+    :class:`TurnFinished` — a crashed tool must never strand the stream.
+
+    ``call_id`` matches this call's :class:`ToolCallStarted` (and any
+    :class:`ToolCallProgress`), so a consumer reconciles start and finish into one card. Same
+    defaulting rule as :class:`ToolCallStarted`: empty on the reconstructed path, the
+    provider's ``tool_call_id`` on the native path.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -101,6 +163,8 @@ class ToolCallFinished(BaseModel):
     kind: Literal["tool_call_finished"] = "tool_call_finished"
     tool: str
     outcome: ToolOutcome
+    call_id: str = ""
+    """Stable per-call id, equal to the matching :class:`ToolCallStarted`'s ``call_id``."""
 
 
 class ArtifactProduced(BaseModel):
@@ -139,6 +203,7 @@ TurnEvent = Annotated[
         TurnStarted,
         TextDelta,
         ToolCallStarted,
+        ToolCallProgress,
         ToolCallFinished,
         ArtifactProduced,
         TurnFinished,

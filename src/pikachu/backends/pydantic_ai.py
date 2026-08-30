@@ -28,8 +28,15 @@ from pydantic_ai.toolsets import FunctionToolset
 from pikachu.backends.base import BaseBackend
 from pikachu.config import DEFAULT_MODEL
 from pikachu.core.errors import PikachuError
-from pikachu.core.events import TextDelta, TurnEvent, TurnFinished, TurnStarted
-from pikachu.core.types import TurnRequest, TurnResult, TurnTiming
+from pikachu.core.events import (
+    TextDelta,
+    ToolCallFinished,
+    ToolCallStarted,
+    TurnEvent,
+    TurnFinished,
+    TurnStarted,
+)
+from pikachu.core.types import ToolOutcome, TurnRequest, TurnResult, TurnTiming
 
 __all__ = ["PydanticAIBackend"]
 
@@ -290,11 +297,36 @@ class PydanticAIBackend(BaseBackend):
     async def stream_turn(self, request: TurnRequest) -> AsyncIterator[TurnEvent]:
         """Native live event stream — the path ``backends/streaming.py`` delegates to.
 
-        The deltas are the SAME ones ``_call`` iterates to measure time-to-first-token; here
-        they are emitted instead of discarded. Each provider SSE chunk becomes one
-        :class:`TextDelta`, so a chat UI renders the answer as it arrives rather than in one
-        blob. The terminal :class:`TurnFinished` carries a full :class:`TurnResult` equal in
-        shape to what ``run_turn`` returns. A live-stream failure falls back to ``run_turn``.
+        Driven by pydantic-ai's flat ``run_stream_events`` stream, which interleaves, in the
+        order the run produces them: text-part deltas, ``FunctionToolCallEvent`` /
+        ``FunctionToolResultEvent`` for each tool call, and a terminal ``AgentRunResultEvent``.
+        We map that stream onto :mod:`pikachu.core.events`:
+
+        * each text delta -> one :class:`TextDelta` (so a chat UI renders the answer as it
+          arrives rather than in one blob — the incrementality this backend was recently fixed
+          to preserve stays preserved: >1 provider chunk -> >1 ``TextDelta``);
+        * ``FunctionToolCallEvent`` -> :class:`ToolCallStarted`, carrying the provider's
+          ``tool_call_id`` as the stable ``call_id`` and the tool name, emitted the instant the
+          call begins so the UI shows a "generating" skeleton for a minutes-long media job;
+        * ``FunctionToolResultEvent`` -> :class:`ToolCallFinished` with the **same** ``call_id``
+          (so start and finish reconcile into one card) and an outcome read from the result
+          part: a ``RetryPromptPart`` is a ``FAILED`` call, anything else is ``SUCCESS``.
+
+        Events are recognised structurally by ``event_kind`` and duck-typed attributes rather
+        than by importing a wall of pydantic-ai symbols — the mapping tolerates an unknown
+        event kind by ignoring it, and only the handful of fields it reads need exist.
+
+        The terminal :class:`TurnFinished` carries a full :class:`TurnResult` equal in shape to
+        what ``run_turn`` returns. A live-stream failure (including a mid-stream provider drop)
+        falls back to ``run_turn`` and STILL emits :class:`TurnFinished`, so a crashed stream
+        never strands the consumer.
+
+        NOTE (integrator): progress *between* start and finish is modelled by
+        :class:`~pikachu.core.events.ToolCallProgress`, but pydantic-ai's flat stream surfaces
+        no per-call progress ticks for an opaque function tool — the provider reports the call
+        as started then returned, nothing in between. So no ``ToolCallProgress`` is emitted from
+        THIS path today; the Lane-3 bridge (which owns the media wrappers and sees generation
+        state) is where progress ticks originate, and the event exists so it can. See HANDOFF.
         """
         yield TurnStarted(agent_name=request.agent.name, streaming=True)
 
@@ -305,16 +337,53 @@ class PydanticAIBackend(BaseBackend):
         try:
             first: float | None = None
             pieces: list[str] = []
-            async with agent.run_stream(request.message) as stream:
-                async for chunk in stream.stream_text(delta=True):
-                    if first is None:
-                        first = time.perf_counter()
-                    if chunk:
-                        pieces.append(chunk)
-                        yield TextDelta(text=chunk)
-                output = str(await stream.get_output())
-                usage = _maybe_call(getattr(stream, "usage", None))
-                messages = list(stream.all_messages())
+            output = ""
+            usage: object = None
+            messages: list[Any] = []
+            async with agent.run_stream_events(request.message) as events:
+                async for event in events:
+                    kind = getattr(event, "event_kind", None)
+                    # ---- text deltas: preserve one-delta-per-chunk incrementality -------
+                    if kind == "part_start":
+                        part = getattr(event, "part", None)
+                        text = _text_of_part(part)
+                        if text:
+                            if first is None:
+                                first = time.perf_counter()
+                            pieces.append(text)
+                            yield TextDelta(text=text)
+                    elif kind == "part_delta":
+                        delta = getattr(event, "delta", None)
+                        raw_delta = getattr(delta, "content_delta", None)
+                        if isinstance(raw_delta, str) and raw_delta:
+                            if first is None:
+                                first = time.perf_counter()
+                            pieces.append(raw_delta)
+                            yield TextDelta(text=raw_delta)
+                    # ---- tool lifecycle: started / finished sharing the provider id -----
+                    elif kind == "function_tool_call":
+                        part = getattr(event, "part", None)
+                        yield ToolCallStarted(
+                            call_id=_tool_call_id_of_event(event, part),
+                            tool=str(getattr(part, "tool_name", "?")),
+                            args=str(getattr(part, "args", ""))[:500],
+                        )
+                    elif kind == "function_tool_result":
+                        part = getattr(event, "part", None)
+                        yield ToolCallFinished(
+                            call_id=_tool_call_id_of_event(event, part),
+                            tool=str(getattr(part, "tool_name", "") or "?"),
+                            outcome=_outcome_of_result_part(part),
+                        )
+                    # ---- terminal result event -----------------------------------------
+                    elif kind == "agent_run_result":
+                        run_result = getattr(event, "result", None)
+                        output = str(getattr(run_result, "output", "") or "")
+                        usage = _maybe_call(getattr(run_result, "usage", None))
+                        all_messages = getattr(run_result, "all_messages", None)
+                        if callable(all_messages):
+                            messages = list(all_messages())
+                    # any other event kind is ignored by design
             done = time.perf_counter()
         except Exception:  # noqa: BLE001 - a live-stream failure must not kill the turn
             result = await self.run_turn(request)
@@ -418,6 +487,47 @@ def _maybe_call(value: object) -> object:
     return value
 
 
+def _text_of_part(part: object) -> str:
+    """Text carried by a ``part_start`` event's part, if it is a text part.
+
+    Read structurally: a ``TextPart`` exposes ``content`` and ``part_kind == "text"``. A
+    tool-call part started here (``part_kind == "tool-call"``) carries no assistant text and
+    must not be mistaken for one, so only a text-kinded part with string ``content`` yields
+    text; everything else yields ``""`` and is ignored by the caller.
+    """
+    if getattr(part, "part_kind", None) == "text":
+        content = getattr(part, "content", None)
+        if isinstance(content, str):
+            return content
+    return ""
+
+
+def _tool_call_id_of_event(event: object, part: object) -> str:
+    """The provider ``tool_call_id`` for a tool call/result event.
+
+    pydantic-ai exposes it as a property on the event itself and also on the underlying part;
+    the event property is preferred, the part is the fallback, and an empty string is the last
+    resort so a missing id never raises inside a stream.
+    """
+    for source in (event, part):
+        tcid = getattr(source, "tool_call_id", None)
+        if isinstance(tcid, str) and tcid:
+            return tcid
+    return ""
+
+
+def _outcome_of_result_part(part: object) -> ToolOutcome:
+    """Map a tool-result part to a :class:`ToolOutcome`.
+
+    pydantic-ai delivers a successful function-tool return as a ``ToolReturnPart`` and a
+    failed one as a ``RetryPromptPart`` (the model is asked to retry). So a ``RetryPromptPart``
+    is the FAILED signal for a crashed/erroring tool; anything else is SUCCESS. The provider
+    does not surface DENIED or INTERRUPTED on this path — those are decided upstream (the guard
+    denies before the call is ever emitted) — so they are deliberately not inferred here.
+    """
+    if type(part).__name__ == "RetryPromptPart":
+        return ToolOutcome.FAILED
+    return ToolOutcome.SUCCESS
 
 
 def _int_of(usage: object, field: str) -> int:
