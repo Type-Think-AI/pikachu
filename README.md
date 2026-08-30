@@ -7,8 +7,16 @@ deliberately leave to the runtime**.
 `pikachu` is an internal codename. The published package name is undecided, so expect exactly one
 rename of the import root before release.
 
-> **Status: wave 1 complete.** The package installs, imports, and passes 239 tests under
-> `mypy --strict`. The permission layer works. There is no live model call yet — that is wave 2.
+> **Status: feature-complete, live-verified.** 847 offline tests + 5 live, `mypy --strict`
+> clean across 60 files in 19 modules, 8/8 badge suites green. The permission layer works.
+> Live model calls work: turns and **incremental streaming** both run against
+> `google/gemini-3.7-flash` — `PydanticAIBackend.run_turn` and `PydanticAIBackend.stream_turn`
+> (the latter yields one `TextDelta` per provider chunk, verified emitting multiple deltas).
+>
+> Not yet built: SSE **media-generation** streaming (image/video tool events), and a bridge
+> from a host application's existing tool registry into `tool_registry`. Those are what a
+> port of PicX's `/agent/*` generation path still needs — see
+> `api/docs/agno-port-plan.md` in the picx-studio repo.
 
 ---
 
