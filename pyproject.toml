@@ -33,6 +33,26 @@ dependencies = [
 mcp = [
     "mcp==2.1.1",
 ]
+# Applied from HANDOFF-V.md. An EXTRA for the same reason `mcp` is one: telemetry must never be
+# the reason a turn fails, so with these absent `telemetry/otel.py` still imports and its
+# no-op tracer swallows everything. Versions verified against the index (both latest).
+#
+# NOTE the gen_ai.* semantic conventions moved to open-telemetry/semantic-conventions-genai and
+# every attribute there is still classified DEVELOPMENT by upstream, so what we emit is pinned
+# deliberately and is expected to churn.
+otel = [
+    "opentelemetry-api==1.44.0",
+    "opentelemetry-sdk==1.44.0",
+]
+# Applied from HANDOFF-W.md, with a CORRECTED version: the handoff proposed 1.20.4, which is a
+# 404 on the index. 2.36.0 is current and pins pydantic-ai-slim==2.36.0 — the exact version this
+# project already has — so the two move together by construction rather than by luck.
+#
+# An extra, and absent means SKIP not fail: evals are tier 2 and never gate a build
+# (docs/12-evaluation.md). The badge case is the gate.
+evals = [
+    "pydantic-evals==2.36.0",
+]
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",

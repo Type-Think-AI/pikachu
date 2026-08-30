@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pikachu.core.errors import SkillParseError
-from pikachu.core.types import Lineage, Skill, Taint, TrustTier
+from pikachu.core.types import Lineage, Skill, TrustTier
+from pikachu.guard.untrusted import SourceKind, admit
 from pikachu.skills.frontmatter import (
     FrontmatterValue,
     parse_frontmatter,
@@ -150,11 +151,30 @@ def load_metadata(text: str) -> SkillMeta:
     return _meta_from_frontmatter(fm)
 
 
-def _lineage_for(trust: TrustTier, source: str) -> Lineage:
-    """A skill from an untrusted origin is tainted FOREIGN_SKILL; trusted stays clean."""
+def _lineage_for(trust: TrustTier, source: str, declared: tuple[str, ...]) -> Lineage:
+    """A skill from an untrusted origin is tainted FOREIGN_SKILL; trusted stays clean.
+
+    The untrusted taint is derived through the shared guard admission path
+    (:func:`pikachu.guard.untrusted.admit`) rather than being built here by hand: routing
+    every untrusted-input boundary through ``admit`` is exactly what success criterion S2
+    requires — one path, not three mechanisms that each happen to work. ``admit`` composes P3
+    (narrowing ``declared`` against the empty load-time allowlist — an untrusted skill declares
+    nothing anyway, which the frozen model enforces) and merges the ``FOREIGN_SKILL`` taint for
+    this source kind. A BUILTIN/VERIFIED skill may contribute tools, so it stays clean and is
+    not run through ``admit`` — admission is for untrusted input.
+    """
     if trust.may_contribute_tools:
         return Lineage.clean()
-    return Lineage.clean().with_taint(Taint.FOREIGN_SKILL, source)
+    # No fixed allowlist exists at skill-load time; the guard's structural rule (an untrusted
+    # skill may declare no tools) is enforced by the Skill model. ``admit`` here supplies the
+    # canonical FOREIGN_SKILL taint on the same code path MCP servers and plugins use.
+    return admit(
+        source,
+        declared_tools=declared,
+        fixed_allowlist=(),
+        trust=trust,
+        kind=SourceKind.FOREIGN_SKILL,
+    ).lineage
 
 
 def load_skill(text: str, *, trust: TrustTier, source: str) -> Skill:
@@ -168,7 +188,7 @@ def load_skill(text: str, *, trust: TrustTier, source: str) -> Skill:
     fm_block, body = split_frontmatter(text)
     fm = parse_frontmatter(fm_block)
     meta = _meta_from_frontmatter(fm)
-    lineage = _lineage_for(trust, source)
+    lineage = _lineage_for(trust, source, meta.declared_tools)
 
     try:
         return Skill(

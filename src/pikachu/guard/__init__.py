@@ -6,8 +6,10 @@ widen it. Authority is never derived from the artifact requesting it — that wa
 escalation path in the parent system, where a skill's own frontmatter decided whether it
 got a paid image tool.
 
-Two entry points:
+Entry points:
   * :func:`effective_tools` — computes the narrowed toolset (invariant P3).
+  * :func:`admit` — the single admission point every untrusted boundary routes through; it
+    COMPOSES :func:`effective_tools` and merges the source's taint (S2's one path).
   * :func:`may_load` / :func:`resolve_trust` — the trust-tiered load gate.
 """
 
@@ -19,10 +21,14 @@ from pikachu.guard.allowlist import (
     effective_tools,
 )
 from pikachu.guard.trust import may_load, resolve_trust
+from pikachu.guard.untrusted import Admission, SourceKind, admit
 
 __all__ = [
     "DANGEROUS_TOOLS",
+    "Admission",
     "EffectiveToolset",
+    "SourceKind",
+    "admit",
     "effective_tools",
     "may_load",
     "resolve_trust",

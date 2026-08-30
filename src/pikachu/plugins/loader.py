@@ -24,6 +24,7 @@ from pathlib import Path
 
 from pikachu.core.errors import PikachuError, SkillParseError
 from pikachu.core.types import Skill, TrustTier
+from pikachu.guard.untrusted import Admission, SourceKind, admit
 from pikachu.plugins.manifest import MANIFEST_FILENAME, PluginManifest, parse_manifest
 from pikachu.skills.loader import load_bundle
 
@@ -36,6 +37,31 @@ __all__ = [
 _SKILLS_DIRNAME = "skills"
 _MCP_FILENAME = "mcp.json"
 _BUNDLE_FILENAME = "SKILL.md"
+
+
+def _admit_plugin_skill(skill: Skill, source: str) -> Admission:
+    """Run one plugin-loaded skill through the shared guard admission path.
+
+    A plugin loads its skills UNTRUSTED, and the frozen :class:`~pikachu.core.types.Skill`
+    model already makes it impossible for an untrusted skill to declare tools. This routes the
+    skill through :func:`pikachu.guard.untrusted.admit` anyway — deliberately — so that the
+    plugin boundary sits on the SAME code path as the MCP-server and foreign-skill boundaries.
+    That single-path property is what success criterion S2 asserts; three mechanisms that each
+    work is not the guarantee.
+
+    The plugin has no fixed allowlist at load time, so the allowlist is empty: ``admit`` narrows
+    the skill's declared tools (already ``()`` for an untrusted skill) against it and returns an
+    empty toolset. The call never raises for a denied tool — it omits — so it cannot turn a
+    graceful denial into a load crash.
+    """
+    return admit(
+        source,
+        declared_tools=skill.declared_tools,
+        fixed_allowlist=(),
+        trust=skill.trust,
+        lineage=skill.lineage,
+        kind=SourceKind.PLUGIN,
+    )
 
 
 @dataclass(frozen=True)
@@ -131,9 +157,16 @@ def _load_skills(
             continue
         skill_source = f"{source}:{_SKILLS_DIRNAME}/{child.name}"
         try:
-            loaded.append(
-                load_bundle(child, trust=TrustTier.UNTRUSTED, source=skill_source)
-            )
+            skill = load_bundle(child, trust=TrustTier.UNTRUSTED, source=skill_source)
+            # Route the plugin's skill through the SINGLE guard admission path. A plugin ships
+            # third-party code, so it is the sharpest untrusted boundary — and S2 requires it
+            # be refused by the SAME path as a hostile MCP server, not by a parallel mechanism.
+            # ``admit`` composes P3: an UNTRUSTED skill declares no tools (the frozen Skill
+            # model enforces that), so the admitted toolset is empty — the plugin can never
+            # contribute a tool through this boundary. The call also carries the FOREIGN_SKILL
+            # taint on the shared path. It never raises for a denial; it omits.
+            _admit_plugin_skill(skill, skill_source)
+            loaded.append(skill)
         except SkillParseError as exc:
             errors.append(
                 ComponentError(

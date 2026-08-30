@@ -43,10 +43,13 @@ from __future__ import annotations
 
 import html
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
 from pikachu.core.errors import PikachuError
+from pikachu.core.types import Lineage
+from pikachu.guard.untrusted import Admission, SourceKind, admit
 
 __all__ = [
     "DEFAULT_TEXT_BUDGET",
@@ -55,6 +58,7 @@ __all__ = [
     "FormParam",
     "WebMcpResultError",
     "WebMcpTextResult",
+    "admit_page_tools",
     "assert_headers_enable_webmcp",
     "to_text_envelope",
     "webmcp_response_headers",
@@ -312,3 +316,39 @@ def render_declarative_form(
 
     lines.append("</form>")
     return "\n".join(lines)
+
+
+def admit_page_tools(
+    origin: str,
+    *,
+    requested_tools: Sequence[str] | None,
+    fixed_allowlist: Sequence[str],
+    lineage: Lineage | None = None,
+) -> Admission:
+    """Narrow the tools a browser page may expose, through the SINGLE guard admission path.
+
+    A WebMCP page is untrusted input: what it asks to put on ``document.modelContext`` is a
+    *request*, never a grant. This routes that request through
+    :func:`pikachu.guard.untrusted.admit` — the exact same path an MCP server, a plugin and a
+    foreign skill go through — so a page can never advertise a tool outside the agent's fixed
+    allowlist. Before this, ``webmcp/`` had no guard reference at all; that gap is precisely
+    what success criterion S2 requires closed, and closed on the *shared* path rather than by a
+    third bespoke mechanism.
+
+    :param origin: The page origin, recorded in the admitted lineage for audit.
+    :param requested_tools: Tool names the page wants to expose. ``None`` means it requested
+        nothing specific and inherits the (dangerous-filtered) allowlist; an empty sequence
+        yields no tools. ``admit`` (via :func:`~pikachu.guard.effective_tools`) honours the
+        distinction.
+    :param fixed_allowlist: The agent's fixed allowlist — the only source of authority.
+    :param lineage: Any existing lineage to merge the web-page taint into.
+    :returns: An :class:`Admission` whose ``tools`` are the page-exposable set and whose
+        ``lineage`` carries the web-page taint. Never raises for a denied tool — it omits.
+    """
+    return admit(
+        origin,
+        declared_tools=requested_tools,
+        fixed_allowlist=fixed_allowlist,
+        lineage=lineage,
+        kind=SourceKind.WEB_PAGE,
+    )

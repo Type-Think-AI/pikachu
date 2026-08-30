@@ -16,6 +16,7 @@ import dataclasses
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from pikachu.config import DEFAULT_MODEL
 from pikachu.core.types import (
     AgentSpec,
     Artifact,
@@ -79,7 +80,7 @@ def _every_model() -> list[BaseModel]:
             instructions="match palette",
             skill_tags=("colour",),
             allowed_tools=("generate_image", "read_canvas"),
-            model="google/gemini-3.5-flash",
+            model=DEFAULT_MODEL,
             triggers=("grade",),
         ),
         Run(
