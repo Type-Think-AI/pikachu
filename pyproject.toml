@@ -23,6 +23,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# An EXTRA, not a core dependency: an agent with no MCP servers never installs it, which
+# matches the wave-2 lazy-import rule. Applied from HANDOFF-I.md.
+#
+# 2.1.1 exposes LATEST_PROTOCOL_VERSION = "2026-07-28", so the modern revision is available.
+# Its DEFAULT_NEGOTIATED_VERSION is "2025-03-26" though, so the client requests the revision
+# explicitly and asserts it in a test - a silent downgrade would otherwise cost statelessness,
+# server/discover and resultType with no error raised.
+mcp = [
+    "mcp==2.1.1",
+]
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
