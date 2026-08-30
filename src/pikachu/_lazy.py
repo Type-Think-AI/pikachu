@@ -71,20 +71,36 @@ __all__ = [
 # here keeps even that cheap subpackage off the bare-import path, and ``pydantic_ai`` stays
 # behind an explicit ``from pikachu.backends.pydantic_ai import PydanticAIBackend``.
 LAZY_SUBMODULES: tuple[str, ...] = (
-    "skills",
+    "a2a",
+    "authz",
+    "backends",
+    "billing",
+    "canvas",
+    "config",
+    "curator",
+    "discovery",
+    "durability",
     "guard",
     "mcp",
-    "canvas",
-    "telemetry",
+    "memory",
+    "plugins",
+    "skills",
     "storage",
-    "backends",
-    "config",
+    "telemetry",
+    "webmcp",
 )
 """Deferred submodule/attribute names for the top-level ``pikachu`` package.
 
 Every name here is loaded lazily. ``core`` is deliberately absent: it holds the 40 public
 types and is imported eagerly by ``__init__`` (cheap, and ``from pikachu import Skill`` needs
 it resolved anyway).
+
+**Kept alphabetical, and it MUST match the ``TYPE_CHECKING`` re-export block in
+``pikachu/__init__.py``.** Those two lists are a guarantee split across two files, and the
+audit (``docs/24-audit.md`` defect 1) caught them disagreeing: ``memory`` was re-exported for
+type checkers while the runtime never wired it, so ``pikachu.memory`` type-checked and then
+raised ``AttributeError``. A guarantee that holds in one place and not another is not a
+guarantee — ``tests/test_regressions.py`` now asserts the two agree.
 """
 
 

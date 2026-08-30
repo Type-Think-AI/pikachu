@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from pikachu.core.errors import SkillParseError
 from pikachu.core.types import (
     Artifact,
     ArtifactKind,
@@ -90,7 +91,17 @@ def _load_front(fm_text: str) -> dict[str, Any]:
             key = line.rstrip().rstrip(":")
             out[key.strip()] = None
             continue
-        out[key.strip()] = json.loads(raw)
+        # A malformed value must stay inside the PikachuError hierarchy. Letting
+        # json.JSONDecodeError escape breaks the package's promise that a host can catch
+        # everything we raise with one clause (docs/24-audit.md defect 4), and a corrupted or
+        # hand-edited export file is exactly the expected way this input goes wrong — these
+        # files are advertised as human-editable.
+        try:
+            out[key.strip()] = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SkillParseError(
+                f"malformed frontmatter value for key {key.strip()!r}: {raw!r}"
+            ) from exc
     return out
 
 

@@ -24,7 +24,13 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from pikachu.core.errors import TaintedPromotion
-from pikachu.core.types import Lineage, MemoryRecord, MemoryScope, Taint
+from pikachu.core.types import (
+    Lineage,
+    MemoryRecord,
+    MemoryScope,
+    Taint,
+    normalize_tool_name,
+)
 from pikachu.guard.lineage import (
     assert_cannot_widen_authority,
     assert_memory_grants_nothing,
@@ -92,9 +98,23 @@ def test_memory_cannot_widen_a_tool_grant() -> None:
 def test_authority_never_exceeds_allowlist(
     allow: list[str], granted: list[str]
 ) -> None:
-    """assert_cannot_widen_authority raises iff granted reaches beyond the allowlist."""
-    allow_set = set(allow)
-    escalates = any(g not in allow_set for g in granted)
+    """assert_cannot_widen_authority raises iff granted reaches beyond the allowlist.
+
+    The model normalises both sides, because the function does. It compared raw strings until
+    the audit (``docs/24-audit.md`` defect 3) showed that made a case or whitespace variant of
+    a permitted tool look like escalation — every other entry point in ``guard/`` normalises,
+    and a guarantee that holds on one path and not another is not a guarantee.
+
+    A name that normalises to empty counts as escalation rather than as nothing: it is not a
+    valid tool name, ``ToolSpec`` rejects it, and letting malformed input pass an authority
+    check quietly is how a bypass gets built. Hypothesis found exactly that case with
+    ``granted=[':']``.
+    """
+    allow_set = {normalize_tool_name(a) for a in allow}
+    allow_set.discard("")
+    escalates = any(
+        (not (norm := normalize_tool_name(g))) or norm not in allow_set for g in granted
+    )
     if escalates:
         with pytest.raises(TaintedPromotion):
             assert_cannot_widen_authority(

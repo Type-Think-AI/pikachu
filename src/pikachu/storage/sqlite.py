@@ -485,10 +485,23 @@ class SqliteMemoryStore:
     async def decay(self, *, older_than_days: int) -> int:
         # Lowers confidence, never deletes. Records already at 0.0 are left alone so the
         # affected count reflects real change.
+        #
+        # The age predicate is the point of the parameter and was missing (docs/24-audit.md
+        # defect 2): every record was decayed regardless of age, so a memory created one
+        # second ago lost rank to decay(older_than_days=99999). That inverts the intent —
+        # decay is meant to demote the STALE, not the fresh — and quietly degrades recall.
+        #
+        # created_at is stored as an ISO-8601 UTC string, and ISO strings compare
+        # lexicographically in the same order as the instants they denote, so a plain string
+        # `<` is correct here and avoids parsing every row.
+        from datetime import timedelta  # local, matching this module's lazy-import style
+
+        cutoff = (utcnow() - timedelta(days=older_than_days)).isoformat()
         with self._conn:
             cur = self._conn.execute(
                 "UPDATE memory SET confidence = MAX(0.0, confidence - 0.1) "
-                "WHERE confidence > 0.0"
+                "WHERE confidence > 0.0 AND created_at < ?",
+                (cutoff,),
             )
             return cur.rowcount
 

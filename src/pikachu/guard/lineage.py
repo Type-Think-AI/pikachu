@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from pikachu.core.errors import TaintedPromotion
-from pikachu.core.types import Lineage, MemoryRecord, Skill, SkillStatus, Taint
+from pikachu.core.types import normalize_tool_name, Lineage, MemoryRecord, Skill, SkillStatus, Taint
 
 __all__ = [
     "PROMOTABLE_STATUSES",
@@ -141,17 +141,38 @@ def assert_cannot_widen_authority(
     to reach beyond ``fixed_allowlist`` this raises :class:`TaintedPromotion` — the same
     class, because widening authority from content is a laundering event of the same kind.
 
-    Comparison is on the raw provided strings; callers upstream already normalise through
-    :func:`~pikachu.core.types.normalize_tool_name` at the allowlist boundary. This function
-    is the memory-side assertion, not a second normaliser.
+    Comparison normalises both sides through
+    :func:`~pikachu.core.types.normalize_tool_name`, exactly as the allowlist boundary does.
+    An earlier version compared raw strings on the reasoning that callers had already
+    normalised — the audit (``docs/24-audit.md`` defect 3) showed that was wrong. Every other
+    entry point in ``guard/`` re-normalises precisely *because* a bare ``tuple[str, ...]`` can
+    arrive from any caller, so a case or whitespace variant of a permitted tool was being
+    reported as authority escalation. A guarantee that holds on one path and not another is
+    not a guarantee, and here the inconsistency produced a false positive on a legitimate
+    grant, which is the kind of alarm that gets a check switched off.
 
     Note this is a *belt* around a structural guarantee, not the only line of defence:
     :attr:`MemoryRecord.may_justify_authority` is typed ``Literal[False]`` so a call site
     cannot branch on memory to grant anything in the first place. This function catches a
     grant that was assembled some other way and still tried to exceed the allowlist.
     """
-    allow = set(fixed_allowlist)
-    escalated = {g for g in granted if g not in allow}
+    allow = {normalize_tool_name(a) for a in fixed_allowlist}
+    allow.discard("")  # an allowlist entry that normalises to nothing grants nothing
+
+    escalated: set[str] = set()
+    for g in granted:
+        norm = normalize_tool_name(g)
+        if not norm:
+            # A name that normalises to empty is not a valid tool name at all -
+            # ``ToolSpec`` rejects these outright - so an authority check must be at least as
+            # strict. Skipping them would let malformed input pass a security boundary
+            # silently, which is how bypasses get built. Hypothesis found this with
+            # granted=[':'] against an empty allowlist. The raw form is kept in the message so
+            # the failure is diagnosable.
+            escalated.add(repr(g))
+        elif norm not in allow:
+            escalated.add(norm)
+
     if escalated:
         raise TaintedPromotion(
             f"{subject} attempted to widen authority to {sorted(escalated)} "
