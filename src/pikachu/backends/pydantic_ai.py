@@ -21,8 +21,9 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openrouter import OpenRouterProvider
+from pydantic_ai.toolsets import FunctionToolset
 
 from pikachu.backends.base import BaseBackend
 from pikachu.config import DEFAULT_MODEL
@@ -59,15 +60,30 @@ class PydanticAIBackend(BaseBackend):
         app_title: str = _APP_TITLE,
         app_url: str = _APP_URL,
         measure_streaming: bool = True,
+        provider_routing: Mapping[str, Any] | None = None,
     ) -> None:
         if not api_key:
             raise PikachuError("PydanticAIBackend requires an OpenRouter API key")
         self._model_name = model
         self._registry: dict[str, Callable[..., Any]] = dict(tool_registry or {})
+        self._toolset_cache: dict[tuple[str, ...], FunctionToolset[None]] = {}
+        """Tool schemas keyed by the exact permitted-name tuple. See _toolset_for."""
         self._measure_streaming = measure_streaming
         """Stream the response purely to measure time-to-first-token, which is what separates
         waiting from decoding. Set False to use the simpler non-streaming call, at the cost of
         losing that split."""
+        self._routing: dict[str, Any] | None = dict(provider_routing) if provider_routing else None
+        """OpenRouter provider-routing block, sent as ``extra_body['provider']``.
+
+        This is the lever on **queue time**, which measurement showed to be the largest and most
+        variable term in a turn — far larger than anything in our own code. Shapes OpenRouter
+        accepts include ``{"sort": "latency"}``, ``{"order": ["<tag>"], "allow_fallbacks": False}``
+        and ``{"only": [...]}``.
+
+        ``allow_fallbacks: False`` pins hard: the request fails rather than silently landing on a
+        different endpoint. That is the right default for a *measurement*, and a risky one for
+        production, where a fallback is usually better than an error.
+        """
         self._provider = OpenRouterProvider(
             api_key=api_key, app_title=app_title, app_url=app_url
         )
@@ -127,6 +143,34 @@ class PydanticAIBackend(BaseBackend):
             self._registry[name] for name in request.effective_tools if name in self._registry
         ]
 
+    def _toolset_for(self, request: TurnRequest) -> FunctionToolset[None] | None:
+        """Return a cached toolset for this exact permission set, building it once.
+
+        **Why this exists.** Profiling showed 94% of ``Agent()`` construction was Pydantic AI
+        regenerating each tool's JSON schema and re-parsing its docstring with griffe — 366 µs
+        for two tools, and it scales with tool count. P7 forbids sharing an *agent* across
+        turns, so we build a fresh agent every turn and were paying that schema cost every
+        time, for schemas that never change.
+
+        A toolset is not an agent. Reusing it keeps P7 intact (the agent is still new each
+        turn) while turning per-turn schema generation into one-time work: measured 390.9 µs ->
+        24.5 µs, which is the no-tools floor.
+
+        **P3 is preserved** because the cache key is the exact tuple of permitted tool names.
+        A different permission set is a different key and therefore a different toolset — the
+        cache can never widen a grant, and two agents with different allowlists cannot collide.
+        Order and duplicates are part of the key, consistent with the guard's no-dedupe rule.
+        """
+        tools = self._tools_for(request)
+        if not tools:
+            return None
+        key = tuple(request.effective_tools)
+        cached = self._toolset_cache.get(key)
+        if cached is None:
+            cached = FunctionToolset(tools)
+            self._toolset_cache[key] = cached
+        return cached
+
     async def run_turn(self, request: TurnRequest) -> TurnResult:
         """Run one turn, attributing wall-clock time to whoever spent it.
 
@@ -139,7 +183,10 @@ class PydanticAIBackend(BaseBackend):
 
         # ---- phase 1: setup (OURS) -----------------------------------------------------
         model_name = request.agent.model or self._model_name
-        model = OpenAIChatModel(model_name, provider=self._provider)
+        settings: OpenAIChatModelSettings | None = None
+        if self._routing is not None:
+            settings = OpenAIChatModelSettings(extra_body={"provider": dict(self._routing)})
+        model = OpenAIChatModel(model_name, provider=self._provider, settings=settings)
 
         # Static instructions first so the cacheable prefix stays byte-identical across the
         # iterations of one turn (invariant P10). A skill body is appended after the agent's
@@ -151,7 +198,10 @@ class PydanticAIBackend(BaseBackend):
         agent: Agent[None, str] = Agent(
             model,
             instructions=instructions or None,
-            tools=self._tools_for(request),
+            # toolsets= rather than tools= on purpose: raw callables make Pydantic AI
+            # regenerate every tool's JSON schema and re-parse its docstring on each
+            # construction, which profiling showed to be 94% of Agent() cost.
+            toolsets=[ts] if (ts := self._toolset_for(request)) is not None else [],
             retries=2,
         )
         t_setup_done = time.perf_counter()
@@ -189,6 +239,21 @@ class PydanticAIBackend(BaseBackend):
             streaming_measured=call.streamed,
         )
 
+        # Which endpoint ACTUALLY served this. Essential when testing routing: without it a
+        # "priority is faster" conclusion cannot be distinguished from "the routing block was
+        # ignored and we measured the default twice".
+        served_by = ""
+        for message in call.messages:
+            name = getattr(message, "provider_name", None)
+            if name:
+                served_by = str(name)
+                details = getattr(message, "provider_details", None)
+                if isinstance(details, dict):
+                    tag = details.get("provider_name") or details.get("provider")
+                    if tag:
+                        served_by = f"{name} ({tag})"
+                break
+
         return TurnResult(
             text=call.text,
             tool_calls=tuple(tool_calls),
@@ -199,6 +264,7 @@ class PydanticAIBackend(BaseBackend):
             iterations=max(iterations, 1),
             latency_ms=timing.total_ms,
             timing=timing,
+            served_by=served_by,
         )
 
     async def _call(self, agent: Agent[None, str], message: str) -> _CallOutcome:

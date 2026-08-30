@@ -617,6 +617,13 @@ class TurnResult(BaseModel):
     """Phase-resolved breakdown. See ``TurnTiming`` — ``framework_ms`` is ours to optimise,
     ``model_ms`` is not."""
 
+    served_by: str = ""
+    """Which provider endpoint actually served the request, when the gateway reports it.
+
+    Load-bearing whenever provider routing is in play: a latency comparison between two routing
+    configurations is meaningless if you cannot confirm the request went where you asked. Empty
+    means the gateway did not say."""
+
     @property
     def cache_hit_ratio(self) -> float:
         """Fraction of prompt tokens served from cache. Success criterion S1 is > 0.

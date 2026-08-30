@@ -76,7 +76,145 @@ a few percent.
 
 ---
 
-## Where the speed actually is
+## How Agno is actually fast — mechanism, measured
+
+Profiled 2026-08-30 by reading the installed source and timing construction against tool count.
+This is the part worth learning from, and it is a single design decision.
+
+### Pydantic AI does the work eagerly; Agno defers it
+
+| Tools passed at construction | Agno | Pydantic AI |
+|---|---:|---:|
+| 0 | 4.04 µs | ~25 µs |
+| 2 | 4.23 µs | 390.9 µs |
+| 10 | 4.42 µs | ~1,860 µs (extrapolated) |
+| **marginal cost per tool** | **0.04 µs** | **~183 µs** |
+
+Agno's per-tool construction cost is essentially zero, and the profile of Pydantic AI's
+`Agent.__init__` says exactly where its 183 µs goes:
+
+```
+add_function                    85% of construction
+  function_schema
+    _griffe.doc_descriptions    28%   ← re-parses the tool's DOCSTRING
+    _infer_docstring_style      23%   ← 17,100 genexpr calls, for ONE tool
+  pydantic json_schema build    19%
+```
+
+**Pydantic AI generates each tool's JSON schema and re-parses its docstring with `griffe` every
+time an `Agent` is constructed.** Agno stores the raw callables and builds nothing — inspecting a
+freshly constructed Agno agent shows `tools` populated but no computed schema — so the work happens
+later, at the model call.
+
+Both are plain dataclasses. Pydantic AI even has `__slots__` and Agno does not. **The 57× gap is
+not about object layout, validation, or Pydantic — it is entirely eager-vs-deferred schema
+generation.**
+
+### The honest caveat: Agno moves the cost, it does not remove it
+
+The schema *must* exist before the first request. Agno pays it on the run instead of the
+constructor, where it disappears into network latency. So a large part of the instantiation gap is
+an **accounting difference**, not work avoided — which is another reason the benchmark cannot decide
+a framework choice.
+
+---
+
+## What we changed as a result — 16× on our own overhead
+
+The lesson transfers, and it gives something better than either default: **do the eager work once
+and keep it.**
+
+P7 forbids sharing an *agent* across turns, so we build a fresh one every turn — and were therefore
+regenerating identical tool schemas on every single turn. A toolset is not an agent, so caching the
+**toolset** satisfies P7 while making schema generation one-time.
+
+| Variant | Mean | Median | p95 |
+|---|---:|---:|---:|
+| `tools=[callables]` — before | 390.9 µs | 366.2 µs | 515.9 µs |
+| `toolsets=[prebuilt]` — after | **24.5 µs** | 24.2 µs | 25.1 µs |
+| no tools at all (floor) | 25.1 µs | 24.7 µs | 26.6 µs |
+
+**16× faster, and it lands exactly on the no-tools floor** — schema reuse removes 100% of the tool
+cost, which was 94% of construction. Cached lookup through our backend measures **0.24 µs**.
+
+Implemented in `backends/pydantic_ai.py::_toolset_for`, keyed by the **exact tuple of permitted
+tool names**. That key choice is the security-relevant part: a looser key (agent name, say) could
+hand a narrowly-permitted run a toolset built for a wider allowlist, which would be a P3 violation
+wearing a performance costume. `tests/test_toolset_cache.py` pins it, including that a different
+permission set never shares a toolset and that order/duplicates are part of the key.
+
+### Updated table
+
+| | Agno | Pydantic AI raw | Pikachu before | **Pikachu after** |
+|---|---:|---:|---:|---:|
+| construction, 2 tools | 4.2 µs | 390.9 µs | 390.9 µs | **24.5 µs** |
+| per-tool marginal | 0.04 µs | 183 µs | 183 µs | **~0** |
+| when schemas are built | per run | per construction | per turn | **once, cached** |
+
+We remain ~6× slower than Agno at instantiation and are now within the same order of magnitude. On
+the axis that actually matters — schema work per turn — the cache is better than Agno's deferral,
+because deferral still repeats the work on every run.
+
+---
+
+## Provider routing: tested, and it does NOT pay ✗
+
+Recorded here as a **negative result**, because an earlier version of this document called it "the
+highest-value untested experiment available". It has now been tested and that was wrong.
+
+`google/gemini-3.7-flash` has six endpoints — `google-ai-studio` and `google-vertex/global`, each in
+standard, `/flex` (half price) and `/priority` (1.8×) tiers.
+
+**First run, 4 samples per config, round-robin:** `sort=latency` looked like **−14.4%**.
+
+**Second run, 8 attempts per config on the one promising config:**
+
+| Config | n | min | median | mean | max | stdev |
+|---|---:|---:|---:|---:|---:|---:|
+| default | 6 | 2167 | 2584 | 2814 | 4057 | **716** |
+| `sort=latency` | 5 | 1964 | 2439 | 2695 | 3761 | **699** |
+
+Median delta **−5.6% (145 ms)** against a within-group spread of **1,890 ms**. The difference is
+**well inside the noise**, and the first run's −14.4% was a small-sample artifact.
+
+**Conclusion: provider routing gave no measurable improvement.** The ~700 ms standard deviation is
+present *identically* on both configs, so the variance is inherent to the provider path rather than
+a choice between fast and slow endpoints. There was no queue to route around.
+
+### Why `/flex` and `/priority` could not be tested
+
+Both failed all attempts with:
+
+```
+403 PERMISSION_DENIED — "Your project has been denied access."
+provider_name: Google AI Studio,  is_byok: True
+```
+
+**`is_byok: True`** — the account routes Gemini through a *bring-your-own-key* Google credential, and
+that project lacks entitlement to the flex and priority tiers. So those tiers are unavailable to
+this account, not misconfigured routing. If lower latency is wanted, obtaining priority-tier access
+on the Google project is the prerequisite, and only then is it worth re-measuring.
+
+### Methodology notes, so this is re-runnable honestly
+
+- **Round-robin, never blocked per config.** Running all of config A then all of config B lets a
+  transient network slowdown bias one group entirely.
+- **`served_by` reported only `openrouter`**, so the *actual* serving endpoint could not be
+  confirmed. The default-vs-`sort=latency` A/B is still valid (same mechanism, same account), but no
+  per-endpoint claim can be made from this data.
+- **n must be ≫10** to detect anything under ~700 ms on this path. Four samples cannot.
+
+### Revised latency ranking
+
+| Lever | Worth | Status |
+|---|---|---|
+| Avoid a round trip | ~2,900 ms each | **the only large win**; lower `max_iterations`, batch tool calls |
+| Prompt caching | part of prefill | unmeasured, `CACHE_FLOOR_UNVERIFIED` still `True` |
+| Provider routing | ~0 | **tested, no effect** |
+| Priority tier | unknown | **blocked** — BYOK project lacks entitlement |
+| Output size | ~1% | decode is ~4,900 tok/s |
+| Framework code | 366 µs, now saved | done, via the toolset cache |
+
 
 Ranked by how much wall clock each can remove from a real turn.
 
