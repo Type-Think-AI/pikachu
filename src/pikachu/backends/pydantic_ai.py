@@ -24,6 +24,13 @@ from typing import Any, Final
 
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.toolsets import FunctionToolset
@@ -74,6 +81,41 @@ _EMPTY_COMPLETION_MARKERS: Final = (
     "invalid response from",
     "validation errors for chatcompletion",
 )
+
+
+def _to_message_history(history: Any) -> list[ModelMessage]:
+    """Convert ``TurnRequest.history`` into pydantic-ai messages.
+
+    ``history`` is the transport shape every host already speaks —
+    ``[{"role": ..., "content": ...}]``, oldest first — while pydantic-ai wants typed
+    ``ModelRequest``/``ModelResponse`` objects. Without this translation the field was
+    accepted and then dropped, so every turn reached the model as a first turn and the
+    agent had no memory of the conversation.
+
+    Roles other than user/assistant are deliberately skipped:
+
+    * ``system`` — instructions belong to ``AgentSpec.instructions``; replaying them as
+      history would duplicate the system prompt and break prefix caching.
+    * ``tool`` — a tool result is only valid when paired with the call that produced it,
+      and that id is not carried in this transport shape. Emitting one alone would build
+      an invalid message sequence, which providers reject outright.
+
+    Blank content is dropped rather than sent: an empty user part is a validation error at
+    some providers, and a stored placeholder row must not be able to fail a live turn.
+    """
+    out: list[ModelMessage] = []
+    for item in history or ():
+        if not isinstance(item, Mapping):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if role in ("user", "human"):
+            out.append(ModelRequest(parts=[UserPromptPart(content=content)]))
+        elif role in ("assistant", "model", "ai"):
+            out.append(ModelResponse(parts=[TextPart(content=content)]))
+    return out
 
 
 def _is_empty_completion(exc: BaseException) -> bool:
@@ -239,7 +281,9 @@ class PydanticAIBackend(BaseBackend):
         t_setup_done = time.perf_counter()
 
         # ---- phase 2+3: the model call (NOT OURS) ---------------------------------------
-        call = await self._call(agent, request.message)
+        call = await self._call(
+            agent, request.message, _to_message_history(request.history)
+        )
 
         # ---- phase 4: finalize (OURS) ---------------------------------------------------
         iterations = sum(1 for m in call.messages if type(m).__name__ == "ModelResponse")
@@ -385,7 +429,10 @@ class PydanticAIBackend(BaseBackend):
             output = ""
             usage: object = None
             messages: list[Any] = []
-            async with agent.run_stream_events(request.message) as events:
+            async with agent.run_stream_events(
+                request.message,
+                message_history=_to_message_history(request.history) or None,
+            ) as events:
                 async for event in events:
                     kind = getattr(event, "event_kind", None)
                     # ---- text deltas: preserve one-delta-per-chunk incrementality -------
@@ -461,7 +508,12 @@ class PydanticAIBackend(BaseBackend):
         )
         yield TurnFinished(result=result)
 
-    async def _call(self, agent: Agent[None, str], message: str) -> _CallOutcome:
+    async def _call(
+        self,
+        agent: Agent[None, str],
+        message: str,
+        message_history: list[ModelMessage] | None = None,
+    ) -> _CallOutcome:
         """Execute the run, retrying only a structurally empty provider response.
 
         See ``_is_empty_completion``. The retry lives here because this is the single
@@ -474,7 +526,7 @@ class PydanticAIBackend(BaseBackend):
         last: BaseException | None = None
         for attempt in range(1, _MAX_UPSTREAM_ATTEMPTS + 1):
             try:
-                return await self._call_once(agent, message)
+                return await self._call_once(agent, message, message_history)
             except Exception as exc:
                 if not _is_empty_completion(exc):
                     raise
@@ -503,7 +555,12 @@ class PydanticAIBackend(BaseBackend):
         assert last is not None  # noqa: S101 - only reachable via the retry break
         raise last
 
-    async def _call_once(self, agent: Agent[None, str], message: str) -> _CallOutcome:
+    async def _call_once(
+        self,
+        agent: Agent[None, str],
+        message: str,
+        message_history: list[ModelMessage] | None = None,
+    ) -> _CallOutcome:
         """Execute the run, capturing the first-token moment when possible.
 
         Streaming is used purely as an **instrument**: it is the only way to separate
@@ -520,7 +577,9 @@ class PydanticAIBackend(BaseBackend):
         if self._measure_streaming:
             try:
                 first: float | None = None
-                async with agent.run_stream(message) as stream:
+                async with agent.run_stream(
+                    message, message_history=message_history or None
+                ) as stream:
                     async for _delta in stream.stream_text(delta=True):
                         if first is None:
                             first = time.perf_counter()
@@ -552,7 +611,7 @@ class PydanticAIBackend(BaseBackend):
                 )
 
         t0 = time.perf_counter()
-        result = await agent.run(message)
+        result = await agent.run(message, message_history=message_history or None)
         return _CallOutcome(
             str(result.output),
             _maybe_call(getattr(result, "usage", None)),

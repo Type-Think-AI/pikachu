@@ -58,7 +58,7 @@ class TestRetry:
         calls = {"n": 0}
         sentinel = object()
 
-        async def flaky(_self, _agent, _message):
+        async def flaky(_self, _agent, _message, _history=None):
             calls["n"] += 1
             if calls["n"] < 2:
                 raise UnexpectedModelBehavior(EMPTY_ENVELOPE_MSG)
@@ -74,7 +74,7 @@ class TestRetry:
     async def test_gives_up_and_reraises_after_the_budget(self, monkeypatch) -> None:
         calls = {"n": 0}
 
-        async def always_empty(_self, _agent, _message):
+        async def always_empty(_self, _agent, _message, _history=None):
             calls["n"] += 1
             raise UnexpectedModelBehavior(EMPTY_ENVELOPE_MSG)
 
@@ -90,7 +90,7 @@ class TestRetry:
     async def test_does_not_retry_a_real_answer(self, monkeypatch) -> None:
         calls = {"n": 0}
 
-        async def refused(_self, _agent, _message):
+        async def refused(_self, _agent, _message, _history=None):
             calls["n"] += 1
             raise UnexpectedModelBehavior("content_policy_violation")
 

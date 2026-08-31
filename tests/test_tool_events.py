@@ -435,7 +435,9 @@ def _make_backend_with_scripted_stream(events: list[Any]) -> Any:
     from pikachu.backends.pydantic_ai import PydanticAIBackend
 
     class _StubAgent:
-        def run_stream_events(self, message: str) -> _FakeEventsHandle:
+        def run_stream_events(
+            self, message: str, *, message_history: object = None
+        ) -> _FakeEventsHandle:
             return _FakeEventsHandle(events)
 
     backend = PydanticAIBackend(api_key="dummy-not-used")
@@ -525,7 +527,9 @@ async def test_pydantic_ai_stream_falls_back_and_still_finishes_on_stream_error(
             raise RuntimeError("provider dropped the connection")
 
     class _StubAgent:
-        def run_stream_events(self, message: str) -> _BoomHandle:
+        def run_stream_events(
+            self, message: str, *, message_history: object = None
+        ) -> _BoomHandle:
             return _BoomHandle()
 
     async def _fallback_run_turn(request: TurnRequest) -> TurnResult:
