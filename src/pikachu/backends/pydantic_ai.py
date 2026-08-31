@@ -15,12 +15,15 @@ symbol used here disappears.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.toolsets import FunctionToolset
@@ -40,8 +43,50 @@ from pikachu.core.types import ToolOutcome, TurnRequest, TurnResult, TurnTiming
 
 __all__ = ["PydanticAIBackend"]
 
+logger = logging.getLogger(__name__)
+
 _APP_TITLE: Final = "Pikachu Agent"
 _APP_URL: Final = "https://picxstudio.com"
+
+# Bounded retry for a provider that answered but said nothing.
+#
+# OpenRouter intermittently returns HTTP 200 with EVERY ChatCompletion field null
+# except ``created``:
+#
+#     ChatCompletion(id=None, choices=None, created=1788197893, model=None, object=None)
+#
+# pydantic-ai validates that into ``UnexpectedModelBehavior`` ("Invalid response from
+# openrouter chat completions endpoint: 4 validation errors for ChatCompletion"), which
+# reaches the user as a hard failure on an otherwise healthy turn. It is the reason a
+# plain "hi" succeeds on one attempt and fails on the next.
+#
+# ``Agent(retries=...)`` does NOT cover this: that budget is for tool/output validation
+# (``ModelRetry``), and a malformed envelope never reaches it.
+#
+# Retrying is safe here specifically because the response is EMPTY — no choices means no
+# completion tokens were produced, so there is nothing billed to repeat and no partial
+# output to duplicate. That is why the predicate below is narrow: a content-policy
+# refusal, an auth error, a rate limit, or a tool-validation failure are all real answers
+# and must surface on the first attempt rather than being hammered.
+_MAX_UPSTREAM_ATTEMPTS: Final = 3
+_UPSTREAM_RETRY_BACKOFF_S: Final = (0.4, 1.2)
+_EMPTY_COMPLETION_MARKERS: Final = (
+    "invalid response from",
+    "validation errors for chatcompletion",
+)
+
+
+def _is_empty_completion(exc: BaseException) -> bool:
+    """True only for a structurally empty/malformed completion envelope.
+
+    Deliberately matches on the validation-failure shape rather than on any
+    ``UnexpectedModelBehavior``: that exception also covers genuine model misbehaviour
+    (e.g. an unparseable tool call) where a retry is not obviously correct.
+    """
+    if not isinstance(exc, UnexpectedModelBehavior):
+        return False
+    text = str(exc).lower()
+    return all(marker in text for marker in _EMPTY_COMPLETION_MARKERS)
 
 
 class PydanticAIBackend(BaseBackend):
@@ -417,6 +462,48 @@ class PydanticAIBackend(BaseBackend):
         yield TurnFinished(result=result)
 
     async def _call(self, agent: Agent[None, str], message: str) -> _CallOutcome:
+        """Execute the run, retrying only a structurally empty provider response.
+
+        See ``_is_empty_completion``. The retry lives here because this is the single
+        point every turn's model invocation passes through, so both the streamed and the
+        plain path are covered by one budget rather than two.
+
+        The final attempt re-raises, so a provider that is genuinely down still surfaces
+        as an error instead of being retried into a timeout.
+        """
+        last: BaseException | None = None
+        for attempt in range(1, _MAX_UPSTREAM_ATTEMPTS + 1):
+            try:
+                return await self._call_once(agent, message)
+            except Exception as exc:
+                if not _is_empty_completion(exc):
+                    raise
+                last = exc
+                if attempt == _MAX_UPSTREAM_ATTEMPTS:
+                    break
+                delay = _UPSTREAM_RETRY_BACKOFF_S[
+                    min(attempt - 1, len(_UPSTREAM_RETRY_BACKOFF_S) - 1)
+                ]
+                logger.warning(
+                    "pikachu: provider returned an empty completion "
+                    "(attempt %d/%d), retrying in %.1fs: %s",
+                    attempt,
+                    _MAX_UPSTREAM_ATTEMPTS,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+
+        logger.error(
+            "pikachu: provider returned an empty completion on all %d attempts; "
+            "failing the turn: %s",
+            _MAX_UPSTREAM_ATTEMPTS,
+            last,
+        )
+        assert last is not None  # noqa: S101 - only reachable via the retry break
+        raise last
+
+    async def _call_once(self, agent: Agent[None, str], message: str) -> _CallOutcome:
         """Execute the run, capturing the first-token moment when possible.
 
         Streaming is used purely as an **instrument**: it is the only way to separate
@@ -445,8 +532,24 @@ class PydanticAIBackend(BaseBackend):
                     return _CallOutcome(text, usage, messages, first, done, True)
                 # No text deltas (e.g. a tool-only response): nothing to split on.
                 return _CallOutcome(text, usage, messages, done, done, False)
-            except Exception:  # noqa: BLE001 - instrumentation must never fail a turn
-                pass
+            except Exception as exc:
+                # An empty provider envelope is NOT an instrumentation problem, so it
+                # must not be absorbed here: falling through would re-run the same
+                # failing request on the plain path, pay the latency twice, and surface
+                # the second failure with the first one's cause erased. Let the retry
+                # wrapper in `_call` see it.
+                if _is_empty_completion(exc):
+                    raise
+                # Anything else really is instrumentation-only — the plain path below
+                # can still answer — but it is logged rather than swallowed. This block
+                # previously did a bare `pass`, which is why a failing stream left no
+                # trace at all and the fallback looked like the original error.
+                logger.warning(
+                    "pikachu: streamed measurement path failed (%s: %s); "
+                    "falling back to a non-streamed run",
+                    type(exc).__name__,
+                    exc,
+                )
 
         t0 = time.perf_counter()
         result = await agent.run(message)
