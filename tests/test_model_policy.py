@@ -1,6 +1,6 @@
 """The model choice is enforced, not remembered.
 
-Standing instruction from the project owner: Pikachu uses ``google/gemini-3.7-flash``.
+Standing instruction from the project owner: Pikachu uses ``google/gemini-3.8-flash``.
 Gemini 2.x must not appear as a model anywhere — not as a default, not as a fallback, not as a
 "runner-up" recommendation somebody could act on.
 
@@ -41,9 +41,9 @@ def _files_to_check() -> list[Path]:
 
 
 @pytest.mark.boulder
-def test_default_model_is_gemini_3_7_flash() -> None:
-    assert DEFAULT_MODEL == "google/gemini-3.7-flash", (
-        f"the default model must be google/gemini-3.7-flash, found {DEFAULT_MODEL!r}"
+def test_default_model_is_gemini_3_8_flash() -> None:
+    assert DEFAULT_MODEL == "google/gemini-3.8-flash", (
+        f"the default model must be google/gemini-3.8-flash, found {DEFAULT_MODEL!r}"
     )
 
 

@@ -16,7 +16,7 @@ from pikachu.config import (
 @pytest.mark.boulder
 def test_default_model_is_the_owners_choice() -> None:
     """Pinned so the default cannot drift without a visible test change."""
-    assert DEFAULT_MODEL == "google/gemini-3.7-flash"
+    assert DEFAULT_MODEL == "google/gemini-3.8-flash"
 
 
 @pytest.mark.boulder

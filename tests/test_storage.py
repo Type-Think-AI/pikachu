@@ -427,7 +427,7 @@ def test_artifact_markdown_round_trip() -> None:
         parent="root",
         provenance=Provenance(
             prompt="a prompt with: colon and\nnewline",
-            model="google/gemini-3.7-flash",
+            model="google/gemini-3.8-flash",
             cost_credits=35,
             seed=42,
             produced_by="colourist",

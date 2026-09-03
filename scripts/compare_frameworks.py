@@ -36,7 +36,7 @@ import sys
 import time
 from collections.abc import Callable
 
-MODEL_ID = "google/gemini-3.7-flash"
+MODEL_ID = "google/gemini-3.8-flash"
 
 # Measured in this project, for context. See scripts/bench.py and the live reports.
 PIKACHU_FRAMEWORK_US = 96.1

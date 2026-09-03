@@ -21,10 +21,13 @@ __all__ = [
     "parse_env_file",
 ]
 
-DEFAULT_MODEL: Final = "google/gemini-3.7-flash"
-"""The default model, chosen by the project owner 2026-08-30.
+DEFAULT_MODEL: Final = "google/gemini-3.8-flash"
+"""The default model, chosen by the project owner 2026-08-30, upgraded to
+``google/gemini-3.8-flash`` on 2026-09-03.
 
-Verified present on OpenRouter the same day, with these specs:
+Verified present on OpenRouter on the upgrade day; the price/spec table below is
+unchanged from 3.7-flash (same $0.75/$3.75 per MTok, same 1M context and native
+video/audio/image/file input), so the cache economics that follow still hold:
 
 ===================  =========================================================
 context length       1,048,576 tokens
